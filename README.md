@@ -38,8 +38,6 @@
 <h3 align="center">[<a href="https://arxiv.org">arXiv</a>]</h3>
 <br>
 
-
-## Overview
 ![Overview](./img/main_figure2.png)
 <b>Overview</b>: **T3D** (Trajectory Self-Distillation via Direct Discriminative Optimization) is a trajectory self-distillation framework designed to enable **high-quality few-step inference** for Diffusion Large Language Models (DLLMs).
 
