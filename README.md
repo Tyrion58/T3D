@@ -18,7 +18,6 @@
   &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=A3WtYhAAAAAJ&hl=en" target="_blank">Hao&nbsp;Wang</a><sup>2,3</sup>
   &ensp; <b>&middot;</b> &ensp;
-  
   <a href="https://scholar.google.com/citations?user=kf3C60wAAAAJ&hl=en" target="_blank">Kai&nbsp;Xu</a><sup>2,3</sup>
   &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=2h6SZeEAAAAJ&hl=en" target="_blank">Akash&nbsp;Srivastava</a><sup>2,3</sup>
