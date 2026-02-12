@@ -1,0 +1,39 @@
+experiment:
+    project: "eval"  # Output directory for evaluation results
+model_base: "sdar"
+rollout:
+    tensor_parallel_size: 1 # set to 1 by default, if oom, try reduce max_active first, if still oom, set tensor_parallel_size to 8
+    max_active: 128
+    num_task_per_step: 1
+    num_response_per_task: 1
+    temperature: 1.0
+    max_token: 2000
+    block_size: 4
+    denoising_steps_per_block: 1
+    top_p: 1.0
+    top_k: 0
+    remasking_strategy: "low_confidence_static" #"low_confidence_static""low_confidence_dynamic"
+    dynamic_threshold: 0.9 # no use for "low_confidence_static"
+    start_with_think: False
+    random_init_ratio: 0.0
+
+    batch_size: 50  # e.g., set to 50 to process 50 prompts at a time in case we run out of KV cache space
+
+execute:
+    num_chunk: 64
+
+evaluation:
+    # Model checkpoint to evaluate (overrides 'model' above if specified)
+    checkpoint_path: "/path/to/specific/checkpoint"
+    
+    # Dataset configuration
+    eval_dataset: "MATH500"    # Dataset name (must exist in data/{eval_dataset}.json)
+    data_type: "math"          # Task type: "math", "code", or "option"
+    
+    # Distributed evaluation (for multi-node setups)
+    num_node: 1                # Total number of nodes
+    node_index: 0              # Current node index (0-indexed)
+    
+    # Output options
+    output_unmasking_history: true  # Save step-by-step unmasking history
+

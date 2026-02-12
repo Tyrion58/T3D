@@ -1,0 +1,76 @@
+wandb:
+  entity: your_entity  # Your wandb username or team name
+  project: "your_project" # need to be same of this file name 
+  resume: false
+  run_id: null  # Run ID, null means auto-generate
+
+
+experiment:
+    project: "ddo_sdar_full_self" # need to be same of this file name 
+    start_from_scratch: True
+    num_node: 1 # the number of machines you have
+    save_every_steps: 256 # the interval of saving checkpoint in global steps
+    max_grad_norm: 1.0
+    gradient_clipping: True
+
+
+model:
+    pretrained_model: "JetLM/SDAR-4B-Chat" # absolute path of your model
+    optimized_name: "optimized" # the output name for your optimized model, will be saved under ddo_sdar_full_self/ckpt
+    random_ratio: 0.1
+
+dataset:
+    optimization_data: "SDAR-4B-Chat-MATH_train_renamed" #"SDAR-4B-Chat-PrimeIntellect_renamed" # "sft_openr1math_sdar"
+    data_type: "math" # "math" "code" 
+
+training:
+    gradient_checkpointing_enable: True # if the sequence is very large, set as True
+    gradient_accumulation_steps: 32  # Adjusted for 6 GPU (8 GPU: 32 -> 6 GPU: 43 to maintain same effective batch size)
+    batch_size_lm: 1
+    mixed_precision: "bf16"
+    enable_tf32: True
+    seed: 10086
+    num_train_epochs: 30
+    max_grad_norm: 1.0
+    method: "semi-ar"  # "semi-ar" or "trace" - SDAR training method (trace is not supported for our case)
+    mask_strategy: "trace"  # or "random"
+    block_size: 8      # the block size for SDAR attention mechanism
+    post_num: 2        # number of pad tokens to train for each data point
+    max_gen_length: 1024  # Maximum generation length
+    max_prompt_len: 512   # Maximum prompt length
+    target_temp: 0.0
+    reference_temp: 0.0
+    alpha: 0.5
+    beta: 0.1
+    path_k_steps: 4  # Number of tokens per large step for path loss (e.g., 2 means every 2 tokens = 1 step)
+    lambda_path: 0.2  # Weight for step_map-based path loss
+    # Variable mask ratios: allows training on different points in the trajectory
+    # Each sample randomly selects a mask ratio from this list according to exponential probability distribution
+    # Higher mask ratios have exponentially higher probability of being selected
+    # If not specified, defaults to [1.0] (fully masked, backward compatible)
+    mask_ratios: [1.0, 0.75, 0.5, 0.25]  # Uncomment to enable variable mask ratios
+    mask_ratio_exponent: 8.0  # Exponential scaling factor for probability distribution (default: 4.0)
+    # Higher exponent = more extreme distribution (100% mask ratio gets even higher probability)
+    # Multi-Round Refinement via Self-Play
+    # When enabled, the reference model is updated after each round (every round_interval epochs)
+    # Round n: reference = p_theta*_{n-1}, target = p_theta_n
+    # After round n completes, reference is updated to p_theta*_n for round n+1
+    multi_round: True    # Enable multi-round refinement self-play
+    round_interval: 10     # Number of epochs per round (total_rounds = num_train_epochs / round_interval)
+
+optimizer:
+    name: adamw
+    params: # default adamw params
+        learning_rate: 1e-5  # Lower learning rate for full fine-tuning
+        scale_lr: False # Scale learning rate by total batch size
+        beta1: 0.9
+        beta2: 0.999
+        weight_decay: 0.01  # Add some weight decay for full fine-tuning
+        epsilon: 1e-8
+
+lr_scheduler:
+    scheduler: "cosine"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 20
+        min_lr_scale: 0.1
