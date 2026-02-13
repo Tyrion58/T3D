@@ -228,6 +228,7 @@ export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 export LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
 ```
 
+## BibTeX
 ```bibtex
 @misc{zhang2026t3dfewstepdiffusionlanguage,
       title={T3D: Few-Step Diffusion Language Models via Trajectory Self-Distillation with Direct Discriminative Optimization}, 
