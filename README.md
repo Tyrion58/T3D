@@ -1,4 +1,4 @@
-<h1 align="center"> T3D: Trajectory Self-Distillation via Direct Discriminative Optimization
+<h1 align="center"> T3D: Few-Step Diffusion Language Models via Trajectory Self-Distillation with Direct Discriminative Optimization
 </h1>
 
 <div align="center" class="project-authors"
