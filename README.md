@@ -14,7 +14,7 @@
   &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=WmK6IOEAAAAJ&hl=en" target="_blank">Xiaoxiao&nbsp;He</a><sup>1</sup>
   &ensp; <b>&middot;</b> &ensp;
-  <a href="https://scholar.google.com/citations?user=51OJEPcAAAAJ&hl=en" target="_blank">Zhuowei&nbsp;Li</a><sup>4</sup>
+  <a href="https://scholar.google.com/citations?user=51OJEPcAAAAJ&hl=en" target="_blank">Zhuowei&nbsp;Li</a><sup>1</sup>
   &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=A3WtYhAAAAAJ&hl=en" target="_blank">Hao&nbsp;Wang</a><sup>2,3</sup>
   &ensp; <b>&middot;</b> &ensp;
@@ -30,7 +30,7 @@
 
   <br>
 
-  <sup>1</sup> Rutgers University &emsp; <sup>2</sup> Red Hat AI Innovation &emsp; <sup>3</sup> MIT-IBM Watson AI Lab &emsp; <sup>4</sup> Amazon &emsp;
+  <sup>1</sup> Rutgers University &emsp; <sup>2</sup> Red Hat AI Innovation &emsp; <sup>3</sup> MIT-IBM Watson AI Lab &emsp;
   <br>
   <sup>*</sup> Equal contribution &emsp; <br>
 </div>
