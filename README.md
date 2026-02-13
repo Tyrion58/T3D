@@ -35,7 +35,7 @@
   <sup>*</sup> Equal contribution &emsp; <br>
 </div>
 
-<h3 align="center">[<a href="https://arxiv.org">arXiv</a>]</h3>
+<h3 align="center">[<a href="https://arxiv.org/abs/2602.12262">arXiv</a>]</h3>
 <br>
 
 ![Overview](./img/main_figure2.png)
