@@ -227,5 +227,18 @@ export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 
 export LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
 ```
+
+```bibtex
+@misc{zhang2026t3dfewstepdiffusionlanguage,
+      title={T3D: Few-Step Diffusion Language Models via Trajectory Self-Distillation with Direct Discriminative Optimization}, 
+      author={Tunyu Zhang and Xinxi Zhang and Ligong Han and Haizhou Shi and Xiaoxiao He and Zhuowei Li and Hao Wang and Kai Xu and Akash Srivastava and Hao Wang and Vladimir Pavlovic and Dimitris N. Metaxas},
+      year={2026},
+      eprint={2602.12262},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2602.12262}, 
+}
+```
+
 # License
 The code is released under the MIT License.
