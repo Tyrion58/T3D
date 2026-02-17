@@ -230,14 +230,11 @@ export LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
 
 ## BibTeX
 ```bibtex
-@misc{zhang2026t3dfewstepdiffusionlanguage,
-      title={T3D: Few-Step Diffusion Language Models via Trajectory Self-Distillation with Direct Discriminative Optimization}, 
-      author={Tunyu Zhang and Xinxi Zhang and Ligong Han and Haizhou Shi and Xiaoxiao He and Zhuowei Li and Hao Wang and Kai Xu and Akash Srivastava and Hao Wang and Vladimir Pavlovic and Dimitris N. Metaxas},
-      year={2026},
-      eprint={2602.12262},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2602.12262}, 
+@article{zhang2026t3d,
+  title={T3D: Few-Step Diffusion Language Models via Trajectory Self-Distillation with Direct Discriminative Optimization},
+  author={Zhang, Tunyu and Zhang, Xinxi and Han, Ligong and Shi, Haizhou and He, Xiaoxiao and Li, Zhuowei and Wang, Hao and Xu, Kai and Srivastava, Akash and Pavlovic, Vladimir and others},
+  journal={arXiv preprint arXiv:2602.12262},
+  year={2026}
 }
 ```
 
