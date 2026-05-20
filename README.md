@@ -1,4 +1,4 @@
-<h1 align="center"> T3D: Few-Step Diffusion Language Models via Trajectory Self-Distillation with Direct Discriminative Optimization
+<h1 align="center"> Few-Step Diffusion Language Models via Trajectory Self-Distillation
 </h1>
 
 <div align="center" class="project-authors"
@@ -22,6 +22,8 @@
   &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=2h6SZeEAAAAJ&hl=en" target="_blank">Akash&nbsp;Srivastava</a><sup>2,3</sup>
   &ensp; <b>&middot;</b> &ensp;
+  <a href="https://scholar.google.com/citations?user=pTTEiHUAAAAJ&hl=en" target="_blank">Chengzhi&nbsp;Mao</a><sup>2,3</sup>
+  &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=NrOA9QoAAAAJ&hl=en" target="_blank">Hao&nbsp;Wang</a><sup>1</sup>
   &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=8MQT8skAAAAJ" target="_blank">Vladimir&nbsp;Pavlovic</a><sup>1</sup>
@@ -38,11 +40,11 @@
 <h3 align="center">[<a href="https://arxiv.org/abs/2602.12262">arXiv</a>]</h3>
 <br>
 
-![Overview](./img/main_figure2.png)
-<b>Overview</b>: **T3D** (Trajectory Self-Distillation via Direct Discriminative Optimization) is a trajectory self-distillation framework designed to enable **high-quality few-step inference** for Diffusion Large Language Models (DLLMs).
+![Overview](./img/T3D.png)
+<b>Overview</b>: We proposed **T3D** (Trajectory Self-Distillation via Direct Discriminative Optimization), a trajectory self-distillation framework designed to enable **high-quality few-step inference** for Diffusion Large Language Models (DLLMs).
 
 While DLLMs provide strong potential for parallel token generation, they often suffer from severe quality degradation when the number of denoising steps is aggressively reduced.
-T3D addresses this challenge by distilling **on-policy generative trajectories** from the model itself, significantly narrowing the performance gap between few-step and full-step decoding.
+T3D addresses this challenge by distilling **generative trajectories** from a full-step teacher model, significantly narrowing the performance gap between few-step and full-step decoding.
 
 ## Key Ideas
 - **Label-Free Training:** Learns entirely from self-generated trajectories without external labels.
