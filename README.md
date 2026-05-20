@@ -22,7 +22,7 @@
   &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=2h6SZeEAAAAJ&hl=en" target="_blank">Akash&nbsp;Srivastava</a><sup>2,3</sup>
   &ensp; <b>&middot;</b> &ensp;
-  <a href="https://scholar.google.com/citations?user=pTTEiHUAAAAJ&hl=en" target="_blank">Chengzhi&nbsp;Mao</a><sup>2,3</sup>
+  <a href="https://scholar.google.com/citations?user=pTTEiHUAAAAJ&hl=en" target="_blank">Chengzhi&nbsp;Mao</a><sup>1</sup>
   &ensp; <b>&middot;</b> &ensp;
   <a href="https://scholar.google.com/citations?user=NrOA9QoAAAAJ&hl=en" target="_blank">Hao&nbsp;Wang</a><sup>1</sup>
   &ensp; <b>&middot;</b> &ensp;
