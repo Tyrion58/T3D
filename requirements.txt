@@ -18,6 +18,7 @@ scipy
 pandas
 scikit-learn
 sentencepiece
+jinja2
 huggingface-hub
 omegaconf
 liger_kernel
@@ -28,3 +29,5 @@ math_verify
 
 wandb
 tensorboard
+# Optional: test suite
+pytest

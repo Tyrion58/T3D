@@ -33,6 +33,7 @@ _os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
 import os
 import re
 import json
+import time
 from termcolor import cprint
 import random
 import torch.multiprocessing as mp
@@ -40,80 +41,17 @@ from jinja2 import Template
 
 from omegaconf import DictConfig, ListConfig, OmegaConf, MISSING
 
-def get_config():
-    cli_conf = OmegaConf.from_cli()
-    yaml_conf = OmegaConf.load(cli_conf.config)
-    conf = OmegaConf.merge(yaml_conf, cli_conf)
-    return conf
-
-def get_eval_config(config, key, default=MISSING):
-    """
-    Helper function to get evaluation config with fallback to old locations.
-    Priority: config.evaluation.* > config.rollout.* > config.experiment.* > default
-    """
-    # Try evaluation section first
-    eval_val = OmegaConf.select(config, f"evaluation.{key}", default=MISSING)
-    if eval_val is not MISSING:
-        return eval_val
-    
-    # Fallback to old locations for backward compatibility
-    rollout_key_map = {
-        "num_response_per_task": "rollout.num_response_per_task",
-        "start_with_think": "rollout.start_with_think",
-        "block_size": "rollout.block_size",
-        "tensor_parallel_size": "rollout.tensor_parallel_size",
-        "stop_token_list": "rollout.stop_token_list",
-        "temperature": "rollout.temperature",
-        "top_k": "rollout.top_k",
-        "top_p": "rollout.top_p",
-        "max_token": "rollout.max_token",
-        "remasking_strategy": "rollout.remasking_strategy",
-        "denoising_steps_per_block": "rollout.denoising_steps_per_block",
-        "dynamic_threshold": "rollout.dynamic_threshold",
-        "max_active": "rollout.max_active",
-        "output_unmasking_history": "rollout.output_unmasking_history",
-        "batch_size": "rollout.batch_size",
-    }
-    
-    dataset_key_map = {
-        "eval_dataset": "dataset.eval_dataset",
-        "data_type": "dataset.data_type",
-    }
-    
-    experiment_key_map = {
-        "num_node": "experiment.num_node",
-        "node_index": "experiment.node_index",
-    }
-    
-    # Try rollout fallback
-    if key in rollout_key_map:
-        rollout_val = OmegaConf.select(config, rollout_key_map[key], default=MISSING)
-        if rollout_val is not MISSING:
-            return rollout_val
-    
-    # Try dataset fallback
-    if key in dataset_key_map:
-        dataset_val = OmegaConf.select(config, dataset_key_map[key], default=MISSING)
-        if dataset_val is not MISSING:
-            return dataset_val
-    
-    # Try experiment fallback
-    if key in experiment_key_map:
-        exp_val = OmegaConf.select(config, experiment_key_map[key], default=MISSING)
-        if exp_val is not MISSING:
-            return exp_val
-    
-    # Return default if provided
-    if default is not MISSING:
-        return default
-    
-    # Raise error if not found
-    raise KeyError(f"Config key '{key}' not found in evaluation section or fallback locations")
-
-
+import sys
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from utils.config import build_outputs_name, get_eval_config, load_config as get_config
+from utils.decoding_stats import decoding_statistics, truncate_at_im_end
+from utils.paths import dataset_file, project_dir
 
 # obtain prompt
 def get_prompt(data_i):
+    raw_prompt = data_i.get("raw_prompt")
+    if raw_prompt is not None:
+        return str(raw_prompt)
     return Template(system_prompts).render(problem = data_i["question"])
 
 def extract_final_boxed_answer(s: str):
@@ -345,7 +283,14 @@ if __name__ == "__main__":
 
     config = get_config()
 
-    
+    # Set random seed for reproducibility
+    eval_seed = get_eval_config(config, "seed", None)
+    if eval_seed is not None:
+        import torch
+        eval_seed = int(eval_seed)
+        random.seed(eval_seed)
+        torch.manual_seed(eval_seed)
+        torch.cuda.manual_seed_all(eval_seed)
 
     tp = int(get_config().rollout.tensor_parallel_size)  # Or check after loading config
 
@@ -446,7 +391,7 @@ if __name__ == "__main__":
     system_prompts = '''<|im_start|>user\n{{problem}}\nPlease reason step by step, and put your final answer within \\boxed{}.<|im_end|>\n<|im_start|>assistant\n'''
     if get_eval_config(config, "start_with_think", False):
         system_prompts = '''<|im_start|>user\nYou need to put your final answer in \\boxed{}. This is the problem:\n{{problem}}<|im_end|>\n<|im_start|>assistant<think>\n'''
-    
+
     project_name = config.experiment.project
 
     code_eval = False
@@ -461,7 +406,15 @@ if __name__ == "__main__":
             pretrained_model = config.model.pretrained_model
     else:
         pretrained_model = checkpoint_path
-    
+
+    # The inference engine reads weights from disk, so a Hub id is not enough.
+    if not pretrained_model or not os.path.isdir(os.path.expanduser(str(pretrained_model))):
+        raise ValueError(
+            f"evaluation.checkpoint_path must be a local model directory (got {pretrained_model!r}). "
+            "Download Hub models first, e.g. "
+            "`huggingface-cli download JetLM/SDAR-4B-Chat --local-dir /path/to/SDAR-4B-Chat`."
+        )
+
     data_type = get_eval_config(config, "data_type")
     if data_type == "code":
         code_eval = True
@@ -473,10 +426,13 @@ if __name__ == "__main__":
         system_prompts = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou need to think step by step and put the final option (A, B, C, or D only—no other character) in \\boxed{}. <|im_end|>\n<|im_start|>assistant\n'''
         if get_eval_config(config, "start_with_think", False):
             system_prompts = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou need to think step by step and put the final option (A, B, C, or D only—no other character) in \\boxed{}. <|im_end|>\n<|im_start|>assistant<think>\n'''
+    elif data_type == "general":
+        system_prompts = '''<|im_start|>user\n{{problem}}<|im_end|>\n<|im_start|>assistant\n'''
     
-    outputs_name = "eval-" + pretrained_model.split("/")[-1] + "-" + dataset
+    # Build output name with rollout config for traceability
+    outputs_name = build_outputs_name(config, pretrained_model, dataset)
 
-    with open("../data/" + dataset + ".json", 'r') as f:
+    with dataset_file(dataset, config).open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     num_node = get_eval_config(config, "num_node", 1)
@@ -629,6 +585,7 @@ if __name__ == "__main__":
         assert len(a) == len(b)
 
     seq_pairs = []
+    gen_t0, gen_t1 = None, None
 
     if ngroups == 1:
         from jetengine_ext.llm import LLM
@@ -681,6 +638,7 @@ if __name__ == "__main__":
         
         try:
             total_processed = 0
+            gen_t0 = time.perf_counter()
             for batch_idx, (prompt_batch, index_batch) in enumerate(zip(prompt_batches, index_batches)):
                 if batch_size and len(prompt_batches) > 1:
                     print(f"[Batch {batch_idx+1}/{len(prompt_batches)}] Processing {len(prompt_batch)} prompts "
@@ -701,10 +659,10 @@ if __name__ == "__main__":
                 if batch_size and batch_size > 0 and batch_idx < len(prompt_batches) - 1:
                     import torch
                     torch.cuda.empty_cache()
+            gen_t1 = time.perf_counter()
         finally:
             _cleanup()
     else:
-        import time
         ctx = mp.get_context("spawn")
         enforce_eager_local = False if tp > 1 else True
 
@@ -713,6 +671,7 @@ if __name__ == "__main__":
 
         out_q = ctx.Queue()
         procs = []
+        gen_t0 = time.perf_counter()
         for g in range(ngroups):
             if len(prompt_chunks_by_group[g]) == 0:
                 continue
@@ -727,7 +686,7 @@ if __name__ == "__main__":
             procs.append(p)
             _child_ps.append(p)   
 
-        import queue, time
+        import queue
 
         results_needed = len(procs)
         results_got = 0
@@ -760,6 +719,7 @@ if __name__ == "__main__":
                     p.join(timeout=5)
                 raise RuntimeError("Worker failed. See traceback above.")
 
+        gen_t1 = time.perf_counter()
         for p in procs:
             p.join()
 
@@ -812,6 +772,19 @@ if __name__ == "__main__":
     response_length = get_token_lengths(restored_outputs, tokenizer)
     mean_response_length = sum(response_length) / len(response_length)
 
+    # Decoding statistics: throughput, latency and denoising steps. Lengths are
+    # measured up to the first <|im_end|> so trailing tokens are not counted.
+    stats_lengths = get_token_lengths([truncate_at_im_end(s) for s in restored_outputs], tokenizer)
+    total_time = (gen_t1 - gen_t0) if (gen_t0 is not None and gen_t1 is not None) else None
+    decoding_stats = decoding_statistics(restored_steps, stats_lengths, block_size, total_time)
+    cprint(f"Average steps per sample (denoising): {decoding_stats['avg_steps']:.2f}", "cyan")
+    cprint(f"Average steps per block: {decoding_stats['avg_steps_per_block']:.2f}", "cyan")
+    cprint(f"Average tokens per step: {decoding_stats['avg_tokens_per_step']:.2f}", "cyan")
+    if decoding_stats["throughput_tps"] is not None:
+        cprint(f"Throughput: {decoding_stats['throughput_tps']:.2f} tokens/s", "cyan")
+        cprint(f"Average latency: {decoding_stats['avg_latency_s']:.3f} s per sample", "cyan")
+        cprint(f"Total generation time: {decoding_stats['total_time_s']:.2f} s", "cyan")
+
 
 
 
@@ -835,11 +808,31 @@ if __name__ == "__main__":
         i += 1
 
     # output the data
+    output_dir = project_dir(config) / "temp_data"
     if num_node > 1:
-        output_file_name = "../" + project_name + f"/temp_data/outputs-{node_index}-" + outputs_name + ".json"
+        output_file_name = output_dir / f"outputs-{node_index}-{outputs_name}.json"
     else:
-        output_file_name = "../" + project_name + "/temp_data/outputs-" + outputs_name + ".json"
-    os.makedirs(os.path.dirname(output_file_name), exist_ok=True)
-    with open(output_file_name, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        output_file_name = output_dir / f"outputs-{outputs_name}.json"
+    # Attach config metadata for traceability
+    rollout_config = OmegaConf.to_container(config.rollout, resolve=True)
+    eval_config = OmegaConf.to_container(
+        config.evaluation, resolve=True) if "evaluation" in config else {}
+    metadata = {
+        "pretrained_model": pretrained_model,
+        "dataset": dataset,
+        "data_type": data_type,
+        "rollout": rollout_config,
+        "evaluation": eval_config,
+        "decoding_stats": decoding_stats,
+    }
+    output = {"_config": metadata, "data": data}
+
+    output_file_name.parent.mkdir(parents=True, exist_ok=True)
+    with output_file_name.open("w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+
+    summary_path = output_file_name.with_name(output_file_name.stem + "-summary.json")
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(decoding_stats, f, indent=2)
+    cprint(f"Decoding statistics saved to: {summary_path}", "green")
 

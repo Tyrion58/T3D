@@ -1,3 +1,46 @@
+# Python
 __pycache__/
-*.json
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environments and local tooling
+.venv/
+venv/
+.env
+.env.*
+.idea/
+.vscode/
+
+# Runtime caches and logs
+*.log
 wandb/
+
+# Generated experiment artifacts. Keep these outside version control even
+# though the default local output root lives inside the repository.
+artifacts/*
+!artifacts/README.md
+/experiments/
+/checkpoints/
+/outputs/
+/results/
+/temp_data/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
+# Local model directory
+local_models/
+
+# Datasets are downloaded/generated locally. Keep scripts and documentation.
+data/*.json
+data/*.jsonl
+data/*.parquet
+data/*.arrow
+
+data/__MACOSX/

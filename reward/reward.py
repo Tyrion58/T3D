@@ -1,6 +1,11 @@
 import json
 import os
-import math_utils
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from reward import math_utils
+from utils.config import build_outputs_name, get_eval_config, load_config as get_config
+from utils.paths import project_dir
 import nest_asyncio
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
@@ -8,57 +13,12 @@ from termcolor import cprint
 
 from omegaconf import OmegaConf, MISSING
 
-def get_config():
-    cli_conf = OmegaConf.from_cli()
-    yaml_conf = OmegaConf.load(cli_conf.config)
-    conf = OmegaConf.merge(yaml_conf, cli_conf)
-    return conf
-
-def get_eval_config(config, key, default=MISSING):
-    """
-    Helper function to get evaluation config with fallback to old locations.
-    Priority: config.evaluation.* > config.dataset.* > config.rollout.* > default
-    """
-    # Try evaluation section first
-    eval_val = OmegaConf.select(config, f"evaluation.{key}", default=MISSING)
-    if eval_val is not MISSING:
-        return eval_val
-    
-    # Fallback to old locations for backward compatibility
-    dataset_key_map = {
-        "eval_dataset": "dataset.eval_dataset",
-        "data_type": "dataset.data_type",
-    }
-    
-    rollout_key_map = {
-        "output_unmasking_history": "rollout.output_unmasking_history",
-    }
-    
-    # Try dataset fallback
-    if key in dataset_key_map:
-        dataset_val = OmegaConf.select(config, dataset_key_map[key], default=MISSING)
-        if dataset_val is not MISSING:
-            return dataset_val
-    
-    # Try rollout fallback
-    if key in rollout_key_map:
-        rollout_val = OmegaConf.select(config, rollout_key_map[key], default=MISSING)
-        if rollout_val is not MISSING:
-            return rollout_val
-    
-    # Return default if provided
-    if default is not MISSING:
-        return default
-    
-    # Raise error if not found
-    raise KeyError(f"Config key '{key}' not found in evaluation section or fallback locations")
-
 if __name__ == "__main__":
 
     config = get_config()
 
     project_name = config.experiment.project
-    
+
 
     dataset = get_eval_config(config, "eval_dataset")
     # Get checkpoint path: evaluation.checkpoint_path > model.pretrained_model > config.model (string)
@@ -71,7 +31,7 @@ if __name__ == "__main__":
             pretrained_model = config.model.pretrained_model
     else:
         pretrained_model = checkpoint_path
-    
+
     # Validate that pretrained_model is set
     if pretrained_model is None:
         raise ValueError(
@@ -80,16 +40,19 @@ if __name__ == "__main__":
             "  - model (as string) or model.pretrained_model in config"
         )
 
-    outputs_name = "eval-" + pretrained_model.split("/")[-1] + "-" + dataset
-    output_base = OmegaConf.select(config, "experiment.output_dir", default=None) or getattr(config.experiment, "output_dir", "..")
-    output_base = os.path.expanduser(str(output_base))
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
-    if not os.path.isabs(output_base):
-        output_base = os.path.normpath(os.path.join(_script_dir, output_base))
-    file_name = os.path.join(output_base, project_name, "temp_data", "outputs-" + outputs_name + ".json")
+    outputs_name = build_outputs_name(config, pretrained_model, dataset)
+    output_dir = project_dir(config)
+    file_name = output_dir / "temp_data" / f"outputs-{outputs_name}.json"
 
     with open(file_name, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        raw = json.load(f)
+    # Support new format with _config metadata
+    _config_meta = None
+    if isinstance(raw, dict) and "_config" in raw:
+        _config_meta = raw["_config"]
+        data = raw["data"]
+    else:
+        data = raw
 
     index_list = []
     extracted_output_list = []
@@ -102,7 +65,7 @@ if __name__ == "__main__":
         response_length_list = response_length_list + data[i]["response_length"]
         index_list = index_list + [i] * len(data[i]["extracted_output"])
         extracted_output_list = extracted_output_list + data[i]["extracted_output"]
-        if data_type == "math":
+        if data_type in ("math", "option"):
             data[i]["correctness"] = []
             # check if there is a ground truth answer key in the data[i]
             if "ground_truth_answer" in data[i]:
@@ -111,7 +74,7 @@ if __name__ == "__main__":
                 ground_truth_list = ground_truth_list + [None] * len(data[i]["extracted_output"])
     
 
-    if data_type == "math":
+    if data_type in ("math", "option"):
 
         nest_asyncio.apply()
 
@@ -140,7 +103,7 @@ if __name__ == "__main__":
 
 
     data_type = get_eval_config(config, "data_type")
-    if data_type == "math":
+    if data_type in ("math", "option"):
         acc = sum(correctness_list)/len(correctness_list)
     else:
         num_task   = 0
@@ -155,14 +118,15 @@ if __name__ == "__main__":
         for i in range(len(data)):
             data[i]["step_map"] = []
     
-    os.makedirs(os.path.dirname(file_name), exist_ok=True)
-    with open(file_name, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    file_name.parent.mkdir(parents=True, exist_ok=True)
+    output = {"_config": _config_meta, "data": data} if _config_meta else data
+    with file_name.open("w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
 
 
-    outputs_result_name = os.path.join(output_base, project_name, "results", "results-" + outputs_name + ".txt")
-    os.makedirs(os.path.dirname(outputs_result_name), exist_ok=True)
-    with open(outputs_result_name, "a") as f:
+    outputs_result_name = output_dir / "results" / f"results-{outputs_name}.txt"
+    outputs_result_name.parent.mkdir(parents=True, exist_ok=True)
+    with outputs_result_name.open("a", encoding="utf-8") as f:
         # Save + print
         def save_and_print(text):
             cprint("\n\n\n" + text, color="green")
@@ -172,3 +136,16 @@ if __name__ == "__main__":
         avg_len = sum(response_length_list)/len(response_length_list)
 
         save_and_print(f"acc: {acc:.4f}\navg length: {avg_len:.4f}")
+
+        # Decoding statistics recorded by the sampler (throughput, latency, steps).
+        stats = (_config_meta or {}).get("decoding_stats")
+        if stats:
+            lines = [
+                f"avg steps: {stats['avg_steps']:.2f}",
+                f"avg steps per block: {stats['avg_steps_per_block']:.2f}",
+                f"avg tokens per step: {stats['avg_tokens_per_step']:.2f}",
+            ]
+            if stats.get("throughput_tps") is not None:
+                lines.append(f"throughput (tokens/s): {stats['throughput_tps']:.2f}")
+                lines.append(f"latency (s/sample): {stats['avg_latency_s']:.3f}")
+            save_and_print("\n".join(lines))

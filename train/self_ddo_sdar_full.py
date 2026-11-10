@@ -6,6 +6,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+import utils.hf_compat  # noqa: F401 — pin compatible SDAR revisions
+
 import json
 import logging
 import math
@@ -31,8 +33,18 @@ from train.prompting_utils import UniversalPrompting
 from models.lr_schedulers import get_scheduler
 from models.logging import set_verbosity_info, set_verbosity_error
 
-from train.prepare import collect_training_data, make_basic_block_attention, process_pad
+from train.prepare import (
+    collect_training_data,
+    make_basic_block_attention,
+    process_pad,
+    collect_clean_data_sdar,
+    sample_and_mask_sdar_one,
+    _sdar_mask_config,
+    _SDAR_STEP_MAP_PAD,
+)
+from train.path_loss import compute_path_loss
 from train.utils import get_config, flatten_omega_conf
+from utils.paths import dataset_file, training_root
 
 try:
     import apex
@@ -142,6 +154,104 @@ def simple_collate(batch):
         "tok_idx_ext": torch.stack(tok_idx_ext),
         "labels": torch.stack(labels),
         "step_map_list": step_map_stacked
+    }
+
+
+class DynamicMaskSDARDataset(Dataset):
+    """
+    SDAR dataset that stores only the clean (unmasked) input_ids plus
+    mask-invariant fields (labels, tok_idx_ext, step_maps), and resamples
+    the mask_ratio + rebuilds (extended_input_ids, p_mask) on every
+    __getitem__ call — i.e. fresh masking every epoch.
+
+    Mirrors the contract of the static TrainDataset so the training loop
+    and collate schema are unchanged. Activated by config.training.dynamic_mask.
+    """
+    def __init__(self, clean_ids, labels, tok_idx_ext, step_maps,
+                 start_pos, pad_id, mask_id, vocab_size, config):
+        self.clean_ids = clean_ids            # [N, L]
+        self.labels = labels                  # [N, L]
+        self.tok_idx_ext = tok_idx_ext        # [N, L+L1] — mask-invariant
+        self.step_maps = step_maps            # [N, L1] or None
+        self.start_pos = start_pos
+        self.pad_id = pad_id
+        self.mask_id = mask_id
+        self.vocab_size = vocab_size
+        self.post_num = getattr(config.training, "post_num", None)
+        self.mc = _sdar_mask_config(config)
+
+    def __len__(self):
+        return self.clean_ids.shape[0]
+
+    def __getitem__(self, idx):
+        clean = self.clean_ids[idx]                                # [L]
+        label = self.labels[idx]                                   # [L]
+        tok_idx = self.tok_idx_ext[idx]                            # [L+L1]
+        step_map_b = self.step_maps[idx] if self.step_maps is not None else None
+
+        extended, p_mask = sample_and_mask_sdar_one(
+            clean, step_map_b,
+            self.start_pos, self.pad_id, self.mask_id, self.vocab_size,
+            self.mc, post_num=self.post_num,
+        )
+
+        # Mirror TrainDataset.__getitem__'s tuple contract so dynamic_collate
+        # can produce the same batch dict the training loop expects.
+        sm_for_loss = (
+            step_map_b.clone() if step_map_b is not None
+            else torch.full((clean.shape[0] - self.start_pos,), -1, dtype=torch.long)
+        )
+        return (
+            idx,
+            extended,
+            p_mask,
+            tok_idx,
+            label,
+            sm_for_loss,
+        )
+
+
+def dynamic_collate(batch):
+    """
+    Collate for DynamicMaskSDARDataset outputs. Produces the same batch dict
+    schema as simple_collate, with one twist: step_map entries use
+    _SDAR_STEP_MAP_PAD for invalid positions (consistent with how
+    sample_and_mask_sdar_one treats step_map), while the path-loss code
+    expects -1 for invalid — so we remap here.
+    """
+    idx, extended_input_ids, p_mask, tok_idx_ext, labels, step_map_list = zip(*batch)
+
+    step_map_tensors = [
+        sm if isinstance(sm, torch.Tensor) else torch.tensor(sm, dtype=torch.long)
+        for sm in step_map_list
+    ]
+    B = len(labels)
+    if B > 0:
+        max_len = max(sm.shape[0] for sm in step_map_tensors)
+        padded = []
+        for sm in step_map_tensors:
+            if sm.shape[0] < max_len:
+                pad = torch.full((max_len - sm.shape[0],), -1, dtype=sm.dtype)
+                sm = torch.cat([sm, pad], dim=0)
+            padded.append(sm)
+        step_map_stacked = torch.stack(padded)
+        # Remap _SDAR_STEP_MAP_PAD -> -1 to match the path-loss convention
+        # in train/path_loss.py (negative step = no recorded order).
+        step_map_stacked = torch.where(
+            step_map_stacked >= _SDAR_STEP_MAP_PAD,
+            torch.full_like(step_map_stacked, -1),
+            step_map_stacked,
+        )
+    else:
+        step_map_stacked = torch.empty((0, 0), dtype=torch.long)
+
+    return {
+        "ids": torch.tensor(idx),
+        "extended_input_ids": torch.stack(extended_input_ids),
+        "p_mask": torch.stack(p_mask),
+        "tok_idx_ext": torch.stack(tok_idx_ext),
+        "labels": torch.stack(labels),
+        "step_map_list": step_map_stacked,
     }
 
 
@@ -282,242 +392,6 @@ def save_checkpoint(model, tokenizer, config, accelerator, name, project_timesta
         logger.info(f"Saved model + tokenizer to {save_base / name}")
 
 
-def reconstruct_xt_from_step_map(x0, step_map, block_size, k_steps, mask_id, pad_id, start_pos):
-    """
-    Reconstruct xt from x0 using step_map decode order.
-    
-    Args:
-        x0: [B, L] clean tokens (full sequence including prefix)
-        step_map: [B, L1] decode order for response tokens (lower = decoded earlier)
-        block_size: size of each block
-        k_steps: number of tokens per large step
-        mask_id: mask token id
-        pad_id: pad token id
-        start_pos: start position of response (L0)
-    
-    Returns:
-        List of xt tensors, one for each step level: [xt_step0, xt_step1, ..., xt_stepN]
-        Each xt is [B, L] with masked tokens according to decode order
-    """
-    B, L = x0.shape
-    L0 = start_pos
-    L1 = L - L0
-    device = x0.device
-    
-    # Extract response part
-    x0_resp = x0[:, start_pos:]  # [B, L1]
-    
-    # Ensure step_map is 2D [B, L1_step] and matches L1 length
-    if step_map.dim() == 1:
-        # If 1D, assume it's for a single sample, expand to batch
-        step_map = step_map.unsqueeze(0)  # [1, L1_step]
-        if step_map.shape[0] != B:
-            step_map = step_map.expand(B, -1)  # [B, L1_step]
-    
-    step_map_L1 = step_map.shape[1]
-    if step_map_L1 != L1:
-        # Trim or pad step_map to match L1
-        if step_map_L1 > L1:
-            # Trim step_map to L1
-            step_map = step_map[:, :L1]  # [B, L1]
-        else:
-            # Pad step_map to L1 with -1 (invalid values)
-            pad_len = L1 - step_map_L1
-            step_map = torch.cat([
-                step_map,
-                torch.full((B, pad_len), -1, dtype=step_map.dtype, device=device)
-            ], dim=1)  # [B, L1]
-    
-    # Calculate number of blocks
-    NB = (L1 + block_size - 1) // block_size  # Number of blocks
-    steps_per_block = (block_size + k_steps - 1) // k_steps  # Steps per block
-    total_steps = NB * steps_per_block
-    
-    # Pad step_map and x0_resp to be divisible by block_size
-    pad_len = NB * block_size - L1
-    if pad_len > 0:
-        step_map_pad = torch.cat([
-            step_map,
-            torch.full((B, pad_len), -1, dtype=step_map.dtype, device=device)
-        ], dim=1)  # [B, NB*block_size]
-        x0_resp_pad = torch.cat([
-            x0_resp,
-            torch.full((B, pad_len), pad_id, dtype=x0_resp.dtype, device=device)
-        ], dim=1)  # [B, NB*block_size]
-    else:
-        step_map_pad = step_map
-        x0_resp_pad = x0_resp
-    
-    # Reshape into blocks: [B, NB, block_size]
-    step_map_blocks = step_map_pad.view(B, NB, block_size)
-    x0_resp_blocks = x0_resp_pad.view(B, NB, block_size)
-    
-    # Store all step-level xt tensors
-    xt_list = []
-    
-    # For each step level
-    for step_level in range(steps_per_block):
-        # For each block, determine which tokens should be decoded at this step level
-        # Step level s should decode the first (s+1)*k_steps tokens (by decode order) in each block
-        # Initialize mask: all tokens should be masked initially
-        mask_blocks = torch.ones(B, NB, block_size, dtype=torch.bool, device=device)
-        
-        # For each block, find tokens that should be decoded at this step level
-        for bi in range(NB):
-            block_step_map = step_map_blocks[:, bi, :]  # [B, block_size]
-            
-            # For each sample in batch, find which tokens to decode in this block
-            for b in range(B):
-                block_sm = block_step_map[b]  # [block_size]
-                
-                # Find valid (non-negative) step_map values
-                valid_mask = block_sm >= 0
-                valid_count = valid_mask.sum().item()
-                
-                if valid_count == 0:
-                    # No valid tokens, keep all masked
-                    continue
-                
-                # Number of tokens to decode at this step level
-                num_to_decode = min((step_level + 1) * k_steps, valid_count)
-                
-                if num_to_decode > 0:
-                    # Get valid step_map values and their indices
-                    valid_step_map = block_sm[valid_mask]  # [valid_count]
-                    valid_indices = torch.where(valid_mask)[0]  # [valid_count]
-                    
-                    # Sort by step_map to get decode order
-                    sorted_indices = torch.argsort(valid_step_map)
-                    # Get indices of tokens to decode
-                    decode_indices = valid_indices[sorted_indices[:num_to_decode]]
-                    
-                    # Unmask these tokens
-                    mask_blocks[b, bi, decode_indices] = False
-                
-                # Also keep tokens that are already decoded (step_map == -1) - these should remain unmasked
-                already_decoded = block_sm == -1
-                mask_blocks[b, bi, :] = mask_blocks[b, bi, :] & (~already_decoded)
-        
-        # Apply masking to response blocks
-        xt_resp_blocks = x0_resp_blocks.clone()
-        xt_resp_blocks[mask_blocks] = mask_id
-        
-        # Handle pad tokens: don't mask pad positions
-        pad_mask = x0_resp_blocks == pad_id
-        xt_resp_blocks[pad_mask] = pad_id
-        
-        # Flatten back to [B, NB*block_size]
-        xt_resp_pad = xt_resp_blocks.view(B, -1)
-        
-        # Remove padding to get [B, L1]
-        xt_resp = xt_resp_pad[:, :L1]
-        
-        # Reconstruct full sequence: prefix + masked response
-        xt = torch.cat([x0[:, :start_pos], xt_resp], dim=1)  # [B, L]
-        
-        xt_list.append(xt)
-    
-    return xt_list
-
-
-def generate_xt_from_step_map(x0, step_map, block_size, k_steps, mask_id, pad_id, start_pos):
-    """
-    Generate true xt from ground truth x0 using step_map decode order.
-    Same logic as reconstruct_xt_from_step_map but uses ground truth x0.
-    
-    Args:
-        x0: [B, L] ground truth clean tokens
-        step_map: [B, L1] decode order for response tokens
-        block_size: size of each block
-        k_steps: number of tokens per large step
-        mask_id: mask token id
-        pad_id: pad token id
-        start_pos: start position of response (L0)
-    
-    Returns:
-        List of xt tensors, one for each step level: [xt_step0, xt_step1, ..., xt_stepN]
-    """
-    # Same implementation as reconstruct_xt_from_step_map
-    return reconstruct_xt_from_step_map(x0, step_map, block_size, k_steps, mask_id, pad_id, start_pos)
-
-
-def compute_path_loss_from_step_map(logits_x0, x0_true, step_map, block_size, k_steps, mask_id, pad_id, start_pos):
-    """
-    Compute path loss between predicted xt and true xt using step_map decode order.
-    
-    Args:
-        logits_x0: [B, L, V] logits from target model
-        x0_true: [B, L] ground truth clean tokens
-        step_map: [B, L1] decode order for response tokens
-        block_size: size of each block
-        k_steps: number of tokens per large step
-        mask_id: mask token id
-        pad_id: pad token id
-        start_pos: start position of response (L0)
-    
-    Returns:
-        Scalar loss value (averaged across all step levels)
-    """
-    device = logits_x0.device
-    B, L, V = logits_x0.shape
-    L0 = start_pos
-    L1 = L - L0
-    
-    # Get predicted x0 from logits
-    x0_pred = torch.argmax(logits_x0, dim=-1)  # [B, L]
-    
-    # Reconstruct xt_predicted for all step levels
-    xt_pred_list = reconstruct_xt_from_step_map(x0_pred, step_map, block_size, k_steps, mask_id, pad_id, start_pos)
-    
-    # Generate xt_true for all step levels
-    xt_true_list = generate_xt_from_step_map(x0_true, step_map, block_size, k_steps, mask_id, pad_id, start_pos)
-    # import ipdb; ipdb.set_trace()
-    # Compute loss for each step level
-    step_losses = []
-    
-    for xt_pred, xt_true in zip(xt_pred_list, xt_true_list):
-        # Only compute loss on response part (start_pos onwards)
-        # xt_pred_resp = xt_pred[:, start_pos:]  # [B, L1]
-        xt_true_resp = xt_true[:, start_pos:]  # [B, L1]
-        x0_true_resp = x0_true[:, start_pos:]  # [B, L1]
-        
-        # Compute loss on non-masked positions (where tokens are decoded, not masked)
-        # Also exclude pad tokens
-        # Non-masked positions: xt_true_resp != mask_id and x0_true_resp != pad_id
-        non_masked_positions = (xt_true_resp != mask_id) & (x0_true_resp != pad_id)
-        
-        if not non_masked_positions.any():
-            # No non-masked positions in this step level, skip
-            continue
-        
-        # Get logits for response part
-        logits_resp = logits_x0[:, start_pos:, :]  # [B, L1, V]
-        
-        # Compute cross-entropy loss on non-masked positions
-        # Flatten for easier indexing
-        non_masked_positions_flat = non_masked_positions.view(-1)  # [B*L1]
-        logits_flat = logits_resp.view(-1, V)  # [B*L1, V]
-        targets_flat = xt_true_resp.view(-1)  # [B*L1]
-        
-        # Get logits and targets for non-masked positions only
-        logits_non_masked = logits_flat[non_masked_positions_flat]  # [N_non_masked, V]
-        targets_non_masked = targets_flat[non_masked_positions_flat]  # [N_non_masked]
-        
-        if len(targets_non_masked) > 0:
-            # Compute cross-entropy loss
-            loss_step = F.cross_entropy(logits_non_masked, targets_non_masked, reduction='mean')
-            step_losses.append(loss_step)
-    
-    # Average losses across all step levels
-    if len(step_losses) > 0:
-        total_loss = sum(step_losses) / len(step_losses)
-    else:
-        # No valid step levels, return zero loss
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-    
-    return total_loss
-
-
 def main():
     #########################
     # SETUP Accelerator     #
@@ -529,7 +403,7 @@ def main():
 
     # Create timestamp-based directory structure
     timestamp = time.strftime("%Y%m%d_%H%M")
-    project_timestamp_dir = Path("experiments") / pretrained_model.split("/")[-1] / config.dataset.data_type / project_name / timestamp
+    project_timestamp_dir = training_root(config) / pretrained_model.split("/")[-1] / config.dataset.data_type / project_name / timestamp
     project_timestamp_dir.mkdir(parents=True, exist_ok=True)
 
     # Enable TF32 on Ampere GPUs
@@ -566,8 +440,10 @@ def main():
             run_id = wandb.util.generate_id()
             config.wandb.run_id = run_id
 
+        wandb_project = config.wandb.get("project", config.experiment.project)
+        wandb_run_name = config.wandb.get("run_name", config.experiment.project)
         wandb_init_kwargs = dict(
-            name=config.experiment.project,
+            name=wandb_run_name,
             id=run_id,
             resume=resume_wandb_run,
             entity=config.wandb.get("entity", None),
@@ -576,7 +452,7 @@ def main():
         wandb_config = {k: v for k, v in flatten_omega_conf(config, resolve=True)}
         wandb_config.pop("experiment.resume_from_checkpoint", None)
         accelerator.init_trackers(
-            config.experiment.project,
+            wandb_project,
             config=wandb_config,
             init_kwargs={"wandb": wandb_init_kwargs},
         )
@@ -672,8 +548,10 @@ def main():
     #################################
     logger.info("Creating dataloaders and lr_scheduler")
 
-    with open("./data/" + config.dataset.optimization_data + ".json", 'r') as f:
+    with dataset_file(config.dataset.optimization_data, config).open("r", encoding="utf-8") as f:
         dataset_load = json.load(f)
+    if isinstance(dataset_load, dict) and "data" in dataset_load:
+        dataset_load = dataset_load["data"]
 
     prompt_list = []
     response_list = []
@@ -687,7 +565,8 @@ def main():
         response_list.append(answer)
         step_map_list.append(x["step_map"][0])
 
-    input_ids_lm, _, start_pos, drop_num = uni_prompting((prompt_list, response_list))
+    input_ids_lm, _, start_pos, drop_num, keep_indices = uni_prompting((prompt_list, response_list))
+    step_map_list = [step_map_list[i] for i in keep_indices]
 
     _, L = input_ids_lm.shape
     L0    = start_pos
@@ -699,12 +578,32 @@ def main():
     
     # Add vocab_size to config for collect_training_data
     vocab_size = tokenizer.vocab_size
-    
-    extended_input_ids, p_mask, tok_idx_ext, labels = collect_training_data(config, input_ids_lm, start_pos, pad_id, mask_id, vocab_size, post_num, step_map_list=step_map_list)
 
-    step_map_list_expanded = step_map_list
+    # Dynamic-mask mode: rebuild (extended_input_ids, p_mask, noise tail) every
+    # epoch via DynamicMaskSDARDataset. Default = False preserves the original
+    # one-shot static-mask behavior.
+    use_dynamic_mask = getattr(config.training, "dynamic_mask", False)
 
-    dataset_lm = TrainDataset(extended_input_ids, p_mask, tok_idx_ext, labels, step_map_list_expanded)
+    if use_dynamic_mask:
+        logger.info("Dynamic masking ENABLED: fresh mask_ratio + response mask every epoch")
+        clean_ids, labels_clean, tok_idx_ext_clean, step_maps_clean, keep = collect_clean_data_sdar(
+            config, input_ids_lm, start_pos, pad_id, step_map_list=step_map_list
+        )
+        dataset_lm = DynamicMaskSDARDataset(
+            clean_ids, labels_clean, tok_idx_ext_clean, step_maps_clean,
+            start_pos=start_pos, pad_id=pad_id, mask_id=mask_id,
+            vocab_size=vocab_size, config=config,
+        )
+        collate_fn = dynamic_collate
+        logger.info(f"  Pre-filter dropped {int((~keep).sum().item())} samples (no valid response)")
+    else:
+        logger.info("Dynamic masking DISABLED: using static one-shot masking")
+        extended_input_ids, p_mask, tok_idx_ext, labels, keep = collect_training_data(
+            config, input_ids_lm, start_pos, pad_id, mask_id, vocab_size, post_num, step_map_list=step_map_list,
+        )
+        step_map_list = [step_map_list[i] for i, k in enumerate(keep.tolist()) if k]
+        dataset_lm = TrainDataset(extended_input_ids, p_mask, tok_idx_ext, labels, step_map_list)
+        collate_fn = simple_collate
 
     total_batch_size_lm = config.training.batch_size_lm * accelerator.num_processes * config.training.gradient_accumulation_steps
     num_update_steps_per_epoch = math.ceil(len(dataset_lm) / total_batch_size_lm)
@@ -729,7 +628,7 @@ def main():
         dataset_lm,
         batch_size=config.training.batch_size_lm,
         sampler=None,
-        collate_fn=simple_collate,
+        collate_fn=collate_fn,
         num_workers=0,
         shuffle=True,
         generator=generator,
@@ -831,19 +730,20 @@ def main():
                 # 5. Compute the loss
                 loss, metrics = compute_loss(config, target_logp_real, target_logp_fake, reference_logp_real, reference_logp_fake)
 
-                # Add step_map-based path loss
+                # Path-consistency regularization (see train/path_loss.py)
                 step_map = batch["step_map_list"].to(accelerator.device)  # [B, L1]
                 k_steps = getattr(config.training, "path_k_steps", 2)
                 lambda_path = getattr(config.training, "lambda_path", 0.05)
-                
-                # Compute path loss from step_map
+                path_loss_type = getattr(config.training, "path_loss_type", "stepwise")
+
                 if step_map.dtype != torch.long:
                     step_map = step_map.long()
-                
-                L_path_step_map = compute_path_loss_from_step_map(
-                    logits_x0_theta, labels, step_map, 
-                    config.training.block_size, k_steps, 
-                    mask_id, pad_id, start_pos
+
+                L_path_step_map = compute_path_loss(
+                    logits_x0_theta, labels, step_map,
+                    config.training.block_size, k_steps,
+                    pad_id, start_pos,
+                    loss_type=path_loss_type,
                 )
                 
                 # Add to total loss
@@ -972,11 +872,24 @@ def main():
                     # Copy weights from trained model to reference model
                     unwrapped_model = accelerator.unwrap_model(model)
                     copy_model_weights(unwrapped_model, ref_model)
-                    
-                    # Save checkpoint at round boundary
+
+                    # Save checkpoint at round boundary (with rotation)
                     name = f"{config.model.optimized_name}-round{current_round}-step{global_step}"
                     save_checkpoint(model, tokenizer, config, accelerator, name, project_timestamp_dir)
-                    
+
+                    # Clean up old round checkpoints, keep only the latest N
+                    round_ckpt_limit = config.experiment.get("round_checkpoints_limit", 3)
+                    if accelerator.is_main_process:
+                        ckpt_base = project_timestamp_dir / "ckpt"
+                        round_ckpts = sorted(
+                            [d for d in ckpt_base.iterdir() if d.name.startswith(f"{config.model.optimized_name}-round")],
+                            key=lambda p: p.stat().st_mtime,
+                        )
+                        if len(round_ckpts) > round_ckpt_limit:
+                            for p in round_ckpts[: len(round_ckpts) - round_ckpt_limit]:
+                                logger.info(f"Removing old round checkpoint: {p.name}")
+                                shutil.rmtree(p)
+
                     if accelerator.is_main_process:
                         logger.info(f"Round {current_round} completed. Reference model updated for Round {current_round + 1}")
                         logger.info("=" * 80)

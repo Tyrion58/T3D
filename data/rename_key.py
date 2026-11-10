@@ -24,22 +24,23 @@ def rename_key_in_json(input_file, output_file):
     with open(input_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    # Process each item in the array
-    if isinstance(data, list):
-        count = 0
-        for item in data:
-            if isinstance(item, dict) and "full_output" in item:
-                item["answer"] = item.pop("full_output")
-                count += 1
-        print(f"Renamed 'full_output' to 'answer' in {count} items")
-    elif isinstance(data, dict):
-        # Handle case where JSON is a single object
-        if "full_output" in data:
-            data["answer"] = data.pop("full_output")
-            print("Renamed 'full_output' to 'answer' in the object")
-    else:
-        print("Warning: Unexpected JSON structure")
+    # Unwrap {"_config": ..., "data": [...]} format if present
+    items = data
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        items = data["data"]
+    elif not isinstance(data, list):
+        print("Warning: Unexpected JSON structure (expected list or {\"data\": [...]})")
         return
+
+    count = 0
+    for item in items:
+        if isinstance(item, dict) and "full_output" in item:
+            item["answer"] = item.pop("full_output")
+            count += 1
+    if count == 0:
+        print("Warning: No 'full_output' keys found — nothing renamed")
+    else:
+        print(f"Renamed 'full_output' to 'answer' in {count} items")
 
     # Write the modified data to output file
     print("Writing output file...")

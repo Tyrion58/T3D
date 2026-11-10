@@ -73,29 +73,19 @@ pip install -r requirements.txt
 conda install -c nvidia cuda
 ```
 
-### 3. (Optional) Configure Cache Directory
+### 3. (Optional) Paths
 
-Useful when using NVMe or shared memory for faster Triton / Torch extension compilation.
+All commands are run from the repository root. Defaults can be redirected with environment variables:
 
-```bash
-export T3D_CACHE_ROOT=/path/to/cache   # default: ~/.cache/t3d
-```
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `T3D_DATA_DIR` | datasets and training files | `<repo>/data` |
+| `T3D_OUTPUT_DIR` | rollouts, results, checkpoints | `<repo>/artifacts` |
+| `T3D_CACHE_ROOT` | Triton / Torch extension cache (use a local disk) | `~/.cache/t3d` |
 
 ## Data Preparation
 
-Place dataset JSON files under:
-
-```
-data/
-```
-
-Example:
-
-```
-data/MATH_train.json
-```
-
-You can download datasets using:
+Dataset JSON files live under `data/`. Download them with:
 
 ```bash
 cd data
@@ -103,6 +93,8 @@ python download_data.py --dataset MATH_train
 python download_data.py --dataset MATH500
 cd ..
 ```
+
+Available datasets: `MATH_train`, `PrimeIntellect` (training prompts) and `MATH500`, `GSM8K`, `MBPP`, `HumanEval` (evaluation).
 
 ## Workflow
 
@@ -114,17 +106,15 @@ The training pipeline consists of three stages:
 
 ## Stage 1 — Rollout (Trajectory Generation)
 
-Run from the `sample/` directory.
-
-Default behavior:
-
-* Input data: `../data/`
-* Output trajectories: `../<experiment.project>/temp_data/`
+Rollout and evaluation read the model from a local directory, so download the teacher first:
 
 ```bash
-cd sample
+huggingface-cli download JetLM/SDAR-4B-Chat --local-dir /path/to/SDAR-4B-Chat
+```
 
-python sdar_sample.py config=../configs/sdar_sample.yaml \
+```bash
+python sample/sdar_sample.py config=configs/rollout/sdar_sample.yaml \
+    evaluation.checkpoint_path=/path/to/SDAR-4B-Chat \
     evaluation.eval_dataset=MATH_train \
     evaluation.data_type=math \
     rollout.block_size=4 \
@@ -134,25 +124,26 @@ python sdar_sample.py config=../configs/sdar_sample.yaml \
     rollout.top_p=1.0 \
     rollout.top_k=0 \
     rollout.remasking_strategy="low_confidence_static"
-
-cd ..
 ```
+
+The rollout is written to `artifacts/rollout_sdar/temp_data/`.
 
 ## Stage 2 — Preprocess Trajectories
 
-Move rollout file into `data/`:
+Copy the rollout file into `data/`:
 
 ```bash
-mv path/to/rollouts.json data/SDAR-4B-Chat-MATH_train.json
+cp artifacts/rollout_sdar/temp_data/outputs-eval-SDAR-4B-Chat-dspb4-bs4-MATH_train.json \
+   data/SDAR-4B-Chat-MATH_train.json
 ```
 
 Then preprocess:
 
 ```bash
-cd data
-python rename_key.py --model_name SDAR-4B-Chat --dataset MATH_train
-cd ..
+python data/rename_key.py --model_name SDAR-4B-Chat --dataset MATH_train
 ```
+
+This produces `data/SDAR-4B-Chat-MATH_train_renamed.json`, the file referenced by `dataset.optimization_data` in the training config.
 
 ## Stage 3 — Training (T3D)
 
@@ -172,33 +163,34 @@ accelerate launch \
   --main_process_port 8889 \
   --config_file accelerate_configs/1_node_8_gpus_deepspeed_zero1.yaml \
   train/self_ddo_sdar_full.py \
-  config=configs/ddo_sdar_full_self.yaml
+  config=configs/train/ddo_sdar_full_self.yaml
 ```
 
-Outputs → `experiments/`
+Checkpoints are saved under `artifacts/experiments/<model>/<data_type>/<project>/<timestamp>/ckpt/`. The reference model is refreshed from the student every `training.round_interval` global steps, and a checkpoint named `optimized-round<N>-step<S>` is written at each refresh.
 
-Training data location:
+| Setting | Config |
+| --- | --- |
+| SDAR-4B-Chat, math | `configs/train/ddo_sdar_full_self.yaml` |
+| SDAR-4B-Chat, code | `configs/train/ddo_sdar_4b_code.yaml` |
+| SDAR-1.7B-Chat, math | `configs/train/ddo_sdar_1_7b_math.yaml` |
+| SDAR-1.7B-Chat, code | `configs/train/ddo_sdar_1_7b_code.yaml` |
 
-```
-data/<config.dataset.optimization_data>.json
-```
+The configs assume 8 GPUs; with fewer GPUs, scale `training.gradient_accumulation_steps` to keep the effective batch size and pick the matching file in `accelerate_configs/`.
 
 ## Checkpoint
 
-We provide a [checkpoint](https://huggingface.co/Tyrion279/SDAR-4B-Chat-t3d-math): SDAR-4B-Chat trained with T3D on MATH_train:
+We provide a [checkpoint](https://huggingface.co/Tyrion279/SDAR-4B-Chat-t3d-math): SDAR-4B-Chat trained with T3D on MATH_train.
+
+```bash
+huggingface-cli download Tyrion279/SDAR-4B-Chat-t3d-math --local-dir /path/to/checkpoint
+```
 
 ## Evaluation
 
-Modify:
-
-```
-configs/eval.yaml
-```
-
-Then run:
+`eval.py` runs the rollout, executes generated code when `data_type=code`, and scores the answers:
 
 ```bash
-python eval.py config=configs/eval.yaml \
+python eval.py config=configs/eval/eval_sdar.yaml \
     evaluation.checkpoint_path=/path/to/checkpoint \
     evaluation.eval_dataset=MATH500 \
     evaluation.data_type=math \
@@ -207,14 +199,26 @@ python eval.py config=configs/eval.yaml \
     rollout.temperature=0.1
 ```
 
+The number of tokens decoded per step is `rollout.block_size / rollout.denoising_steps_per_block`. Results are appended to `artifacts/<experiment.project>/results/`, together with decoding statistics (average denoising steps, tokens per step, throughput and latency).
+
+| Scenario | Overrides |
+| --- | --- |
+| Dynamic decoding | `rollout.remasking_strategy=low_confidence_dynamic rollout.dynamic_threshold=0.9` |
+| Greedy decoding | `rollout.temperature=0` |
+| Code benchmarks | `evaluation.eval_dataset=MBPP evaluation.data_type=code` (or `HumanEval`) |
+
 ## Configuration Guide
 
-| Component  | Config File                       |
+| Component  | Location                          |
 | ---------- | --------------------------------- |
-| Rollout    | `configs/sdar_sample.yaml`        |
-| Training   | `configs/ddo_sdar_full_self.yaml` |
+| Rollout    | `configs/rollout/sdar_sample.yaml` |
+| Training   | `configs/train/`                  |
+| Evaluation | `configs/eval/eval_sdar.yaml`     |
 | Multi-GPU  | `accelerate_configs/`             |
-| Evaluation | `configs/eval.yaml`               |
+
+All entry points accept OmegaConf overrides on the command line (`key.subkey=value`). The SDAR base models are loaded at a pinned Hub revision (`utils/hf_compat.py`) that matches `transformers==4.52.4`.
+
+A CPU-only test suite is available with `python -m pytest tests/`.
 
 ## Troubleshooting: CUDA / Compilation Issues
 

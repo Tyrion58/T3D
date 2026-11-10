@@ -1,0 +1,80 @@
+# T3D on SDAR-1.7B-Chat, MATH trajectories.
+# Same as ddo_sdar_full_self.yaml except for the keys marked [changed].
+wandb:
+  entity: null  # set via WANDB_ENTITY or `wandb login`
+  project: "ddo_sdar_1_7b_math"
+  resume: false
+  run_id: null  # null = auto-generate
+
+experiment:
+    project: "ddo_sdar_1_7b_math"
+    start_from_scratch: True
+    num_node: 1
+    save_every_steps: 128       # checkpoint interval in global steps
+    round_checkpoints_limit: 3  # keep only the latest N round checkpoints
+    max_grad_norm: 1.0
+    gradient_clipping: True
+
+model:
+    pretrained_model: "JetLM/SDAR-1.7B-Chat"  # [changed]
+    optimized_name: "optimized"             # checkpoint name prefix
+    random_ratio: 0.1                       # share of masked inputs replaced by random tokens
+
+dataset:
+    optimization_data: "SDAR-1.7B-Chat-MATH_train_renamed"  # [changed]
+    data_type: "math"  # "math" | "code" | "general"
+
+training:
+    gradient_checkpointing_enable: True
+    # Effective batch = batch_size_lm x num_gpus x gradient_accumulation_steps.
+    # 32 assumes 8 GPUs (effective batch 256); scale it if you use fewer GPUs.
+    gradient_accumulation_steps: 32
+    batch_size_lm: 1
+    mixed_precision: "bf16"
+    enable_tf32: True
+    seed: 10086
+    num_train_epochs: 10
+    max_grad_norm: 1.0
+    method: "semi-ar"
+    block_size: 8          # training block size
+    post_num: 2            # trailing pad tokens kept in the loss per sample
+    max_gen_length: 1024   # [changed]
+    max_prompt_len: 512    # [changed]
+
+    # --- DDO objective ---
+    target_temp: 0.0
+    reference_temp: 0.0
+    alpha: 0.5
+    beta: 0.1
+
+    # --- intermediate states along the teacher trajectory ---
+    mask_strategy: "trace"                # "trace": follow the teacher decode order | "random"
+    mask_ratios: [1.0, 0.75, 0.5, 0.25]   # one ratio is drawn per sample ...
+    mask_ratio_exponent: 8.0              # ... with probability proportional to ratio ** exponent
+    dynamic_mask: False                   # True: redraw ratio and mask every epoch
+
+    # --- path-consistency regularisation (train/path_loss.py) ---
+    lambda_path: 0.2
+    path_k_steps: 4               # tokens decoded per step inside a block
+    path_loss_type: "stepwise"    # "stepwise" | "weighted"
+
+    # --- multi-round self-play: the reference model is refreshed from the student ---
+    multi_round: True
+    round_interval: 10   # global steps per round
+
+optimizer:
+    name: adamw
+    params:
+        learning_rate: 1e-5
+        scale_lr: False
+        beta1: 0.9
+        beta2: 0.999
+        weight_decay: 0.01
+        epsilon: 1e-8
+
+lr_scheduler:
+    scheduler: "cosine"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 20
+        min_lr_scale: 0.0   # final LR = min_lr_scale x learning_rate

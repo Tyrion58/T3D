@@ -95,7 +95,7 @@ class UniversalPrompting():
         )['input_ids']
 
         input_ids_lm, labels_lm, start_pos = self.lm_prompt((prompt_ids, response_ids))
-        return input_ids_lm, labels_lm, start_pos, drop_num
+        return input_ids_lm, labels_lm, start_pos, drop_num, keep_indices
 
 
 if __name__ == '__main__':

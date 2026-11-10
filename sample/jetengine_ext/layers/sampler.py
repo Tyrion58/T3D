@@ -27,6 +27,12 @@ def sample_with_temperature_topk_topp(logits, temperature=1.0, top_k=0, top_p=1.
 
     logits = logits.reshape(-1, vocab_size)  # [batch*block, vocab]
 
+    if temperature == 0:
+        token = logits.argmax(dim=-1, keepdim=True)  # [batch*block, 1]
+        probs = F.softmax(logits, dim=-1)
+        token_prob = torch.gather(probs, -1, token)
+        return token.view(*orig_shape), token_prob.view(*orig_shape)
+
     if temperature != 1.0:
         logits = logits / temperature
     if top_k > 0:

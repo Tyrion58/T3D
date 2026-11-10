@@ -380,4 +380,218 @@ def collect_training_data(config, input_ids, start_pos, pad_id, mask_id, vocab_s
     tok_idx_ext       = tok_idx_ext[keep]
     labels            = labels[keep]
 
-    return extended_input_ids, p_mask, tok_idx_ext, labels
+    return extended_input_ids, p_mask, tok_idx_ext, labels, keep
+
+
+# ============================================================================
+#  Dynamic-Mask Helpers for SDAR (per-epoch fresh masking)
+# ----------------------------------------------------------------------------
+#  The default SDAR path (collect_training_data above) builds the masked
+#  extended_input_ids / p_mask once and freezes them for the whole run. The
+#  helpers below split that work into:
+#    - collect_clean_data_sdar(): one-shot precompute of mask-invariant fields
+#      (clean input_ids, labels, tok_idx_ext, padded step_map)
+#    - sample_and_mask_sdar_one(): per-sample, per-epoch mask_ratio sampling +
+#      response mask + noise tail + p_mask trimming
+#  Enabled with training.dynamic_mask=true.
+# ============================================================================
+
+_SDAR_STEP_MAP_PAD = 999999
+
+
+def collect_clean_data_sdar(config, input_ids, start_pos, pad_id, step_map_list=None):
+    """
+    Precompute mask-invariant tensors for SDAR dynamic masking.
+
+    Returns:
+        clean_ids:    [N, L] filtered clean input_ids (prefix + response)
+        labels:       [N, L] same as clean_ids (labels are the clean targets)
+        tok_idx_ext:  [N, L + L1] position ids for the extended sequence
+                      (mask-invariant — depends only on pad structure)
+        step_maps:    [N, L1] padded with _SDAR_STEP_MAP_PAD, or None
+        keep:         [B] boolean mask indicating which original samples survived
+    """
+    if config.training.method != "semi-ar":
+        raise ValueError(f"collect_clean_data_sdar only supports method='semi-ar', got {config.training.method}")
+
+    B, L = input_ids.shape
+    L0 = start_pos
+    L1 = L - L0
+    device = input_ids.device
+
+    # Position ids for extended sequence: mask-invariant
+    idx = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+    valid = (idx >= start_pos) | input_ids.ne(pad_id)
+    tok_idx = valid.long().cumsum(dim=-1) - 1
+    tok_idx = tok_idx.masked_fill(~valid, 1)
+    tok_idx_resp = tok_idx[:, start_pos:]
+    tok_idx_ext = torch.cat([tok_idx, tok_idx_resp], dim=1)  # [B, L+L1]
+
+    labels = input_ids.clone()
+
+    # Pad step_maps to a uniform [B, L1]
+    step_maps = None
+    if step_map_list is not None and len(step_map_list) > 0:
+        padded = []
+        for b in range(B):
+            sm = step_map_list[b]
+            if isinstance(sm, (list, tuple)):
+                sm_t = torch.tensor(sm, dtype=torch.long)
+            elif isinstance(sm, torch.Tensor):
+                sm_t = sm.clone().long()
+            else:
+                sm_t = torch.tensor(sm, dtype=torch.long)
+            if sm_t.shape[0] < L1:
+                pad = torch.full((L1 - sm_t.shape[0],), _SDAR_STEP_MAP_PAD, dtype=sm_t.dtype)
+                sm_t = torch.cat([sm_t, pad], dim=0)
+            elif sm_t.shape[0] > L1:
+                sm_t = sm_t[:L1]
+            padded.append(sm_t)
+        step_maps = torch.stack(padded, dim=0).to(device)  # [B, L1]
+
+    # Pre-filter samples that have no valid response position — with no valid
+    # positions there is no way to produce a non-empty p_mask for any mask_ratio.
+    if step_maps is not None:
+        has_valid = (step_maps < _SDAR_STEP_MAP_PAD).any(dim=1)
+    else:
+        resp = input_ids[:, L0:]
+        has_valid = (resp != pad_id).any(dim=1)
+
+    keep = has_valid
+    clean_ids = input_ids[keep].contiguous()
+    labels = labels[keep].contiguous()
+    tok_idx_ext = tok_idx_ext[keep].contiguous()
+    if step_maps is not None:
+        step_maps = step_maps[keep].contiguous()
+
+    return clean_ids, labels, tok_idx_ext, step_maps, keep
+
+
+def _sdar_mask_config(config):
+    """Parse mask_ratios + exponent-weighted probs + other mask options."""
+    mask_ratios = config.training.get("mask_ratios", None)
+    if mask_ratios is None:
+        mask_ratios = [1.0]
+    elif isinstance(mask_ratios, (int, float)):
+        mask_ratios = [mask_ratios]
+    else:
+        try:
+            mask_ratios = list(mask_ratios)
+        except (TypeError, AttributeError):
+            pass
+
+    exponent = config.training.get("mask_ratio_exponent", 4.0)
+    ratios_t = torch.tensor(mask_ratios, dtype=torch.float32)
+    weights = ratios_t ** exponent
+    probs = weights / weights.sum()
+
+    strategy = config.training.get("mask_strategy", "trace")
+    if strategy not in ("trace", "random"):
+        raise ValueError(f"mask_strategy must be 'trace' or 'random', got '{strategy}'")
+
+    return {
+        "mask_ratios": mask_ratios,
+        "probs": probs,
+        "mask_strategy": strategy,
+        "block_size": config.training.block_size,
+        "random_ratio": config.model.get("random_ratio", 0.0),
+    }
+
+
+def sample_and_mask_sdar_one(
+    clean_ids_b, step_map_b, start_pos, pad_id, mask_id, vocab_size,
+    mc, post_num=None,
+):
+    """
+    Build one dynamic training sample for SDAR with a freshly sampled mask_ratio.
+
+    Args:
+        clean_ids_b:   [L] clean prefix+response for one sample (CPU ok)
+        step_map_b:    [L1] padded step map, or None for random strategy
+        mc:            dict from _sdar_mask_config()
+
+    Returns:
+        extended_input_ids_b: [L + L1] = [prefix | clean_response | noisy_response]
+        p_mask_b:             [L] positions contributing to the loss
+    """
+    device = clean_ids_b.device
+    L = clean_ids_b.shape[0]
+    L0 = start_pos
+    L1 = L - L0
+
+    # 1) Sample a fresh mask_ratio for this sample.
+    idx_sel = torch.multinomial(mc["probs"], 1).item()
+    mask_ratio = mc["mask_ratios"][idx_sel]
+
+    use_trace = (mc["mask_strategy"] == "trace") and (step_map_b is not None)
+    block_size = mc["block_size"]
+
+    # 2) Build response_mask [L1] block by block.
+    response_mask = torch.zeros(L1, dtype=torch.bool, device=device)
+    NB = (L1 + block_size - 1) // block_size
+    for bi in range(NB):
+        bstart = bi * block_size
+        bend = min((bi + 1) * block_size, L1)
+        blen = bend - bstart
+        if use_trace:
+            block_sm = step_map_b[bstart:bend]
+            block_idx = torch.arange(bstart, bend, device=device)
+            valid = block_sm < _SDAR_STEP_MAP_PAD
+            valid_idx = block_idx[valid]
+            valid_sm = block_sm[valid]
+            if len(valid_idx) > 0:
+                sorted_idx = valid_idx[torch.argsort(valid_sm)]
+                n_mask = int(len(sorted_idx) * mask_ratio)
+                if n_mask > 0:
+                    response_mask[sorted_idx[:n_mask]] = True
+        else:
+            n_mask = int(blen * mask_ratio)
+            if n_mask > 0:
+                perm = torch.randperm(blen, device=device)[:n_mask]
+                response_mask[bstart + perm] = True
+
+    # 3) Build p_mask [L] and trim trailing pads via post_num (mirrors static path).
+    p_mask = torch.zeros(L, dtype=torch.bool, device=device)
+    p_mask[L0:] = response_mask
+
+    pad_resp = (clean_ids_b == pad_id) & p_mask
+    if post_num is not None:
+        cum_pad = torch.cumsum(pad_resp.int(), dim=0)
+        p_mask &= ~(pad_resp & (cum_pad > post_num))
+
+    # Safety: compute_logp divides by p_mask.sum() with no clamp, so empty
+    # p_mask would NaN the loss. Force at least one real (non-pad, valid) mask.
+    if not p_mask.any():
+        if use_trace:
+            valid_pos = (step_map_b < _SDAR_STEP_MAP_PAD) & (clean_ids_b[L0:] != pad_id)
+        else:
+            valid_pos = clean_ids_b[L0:] != pad_id
+        nz = torch.nonzero(valid_pos, as_tuple=True)[0]
+        if len(nz) > 0:
+            pos = nz[0].item()
+            response_mask[pos] = True
+            p_mask[L0 + pos] = True
+
+    # 4) Build noise_tail from the clean response, apply mask/random corruption.
+    noise_tail = clean_ids_b[L0:].clone()
+    if mc["random_ratio"] > 0 and vocab_size is not None:
+        masked_idx = torch.where(response_mask)[0]
+        if len(masked_idx) > 0:
+            n_rand = min(max(1, int(len(masked_idx) * mc["random_ratio"])), len(masked_idx))
+            rand_sel = masked_idx[torch.randperm(len(masked_idx), device=device)[:n_rand]]
+            rand_flat = torch.zeros(L1, dtype=torch.bool, device=device)
+            rand_flat[rand_sel] = True
+            mask_only = response_mask & ~rand_flat
+            if rand_flat.any():
+                noise_tail[rand_flat] = torch.randint(
+                    0, vocab_size, (int(rand_flat.sum().item()),),
+                    device=device, dtype=noise_tail.dtype,
+                )
+            if mask_only.any():
+                noise_tail[mask_only] = mask_id
+    else:
+        noise_tail[response_mask] = mask_id
+
+    # 5) Extended sequence: [clean(L0+L1) | noisy_response(L1)]
+    extended_input_ids_b = torch.cat([clean_ids_b, noise_tail], dim=0)  # [L + L1]
+    return extended_input_ids_b, p_mask

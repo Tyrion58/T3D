@@ -7,15 +7,9 @@ from termcolor import cprint
 from tqdm import tqdm
 from omegaconf import DictConfig, ListConfig, OmegaConf, MISSING
 
-
-def get_config():
-    cli_conf   = OmegaConf.from_cli()
-    yaml_conf  = OmegaConf.load(cli_conf.config)
-    return OmegaConf.merge(yaml_conf, cli_conf)
-
-
-
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.config import build_outputs_name, load_config as get_config
+from utils.paths import project_dir
 
 
 from concurrent.futures import as_completed
@@ -521,24 +515,27 @@ def main():
     if dataset is None:
         raise ValueError("evaluation.eval_dataset is required in config")
     
-    outputs_name = "eval-" + pretrained_model.split("/")[-1] + "-" + dataset
+    outputs_name = build_outputs_name(cfg, pretrained_model, dataset)
 
-    output_base = OmegaConf.select(cfg, "experiment.output_dir", default=None) or getattr(cfg.experiment, "output_dir", "..")
-    output_base = os.path.expanduser(str(output_base))
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
-    if not os.path.isabs(output_base):
-        output_base = os.path.normpath(os.path.join(_script_dir, output_base))
+    output_dir = project_dir(cfg)
 
     num_node = cfg.evaluation.num_node
     node_index = cfg.evaluation.node_index
 
     if num_node > 1:
-        file_name = os.path.join(output_base, project_name, "temp_data", f"outputs-{node_index}-{outputs_name}.json")
+        file_name = output_dir / "temp_data" / f"outputs-{node_index}-{outputs_name}.json"
     else:
-        file_name = os.path.join(output_base, project_name, "temp_data", f"outputs-{outputs_name}.json")
+        file_name = output_dir / "temp_data" / f"outputs-{outputs_name}.json"
 
     with open(file_name, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        raw = json.load(f)
+    # Support new format with _config metadata
+    _config_meta = None
+    if isinstance(raw, dict) and "_config" in raw:
+        _config_meta = raw["_config"]
+        data = raw["data"]
+    else:
+        data = raw
 
     func_items  = [itm for itm in data if itm.get("test_method","function") == "function"]
     stdio_items = [itm for itm in data if itm.get("test_method") == "stdio"]
@@ -565,10 +562,11 @@ def main():
     
     
 
-    # --- save JSON ---
-    os.makedirs(os.path.dirname(file_name), exist_ok=True)
-    with open(file_name, "w", encoding="utf-8", errors="surrogatepass") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # --- save JSON (preserve _config metadata if present) ---
+    file_name.parent.mkdir(parents=True, exist_ok=True)
+    output = {"_config": _config_meta, "data": data} if _config_meta else data
+    with file_name.open("w", encoding="utf-8", errors="surrogatepass") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
     
 
     

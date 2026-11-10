@@ -126,9 +126,10 @@ class Scheduler:
         
         elif run_type == RunType.DENOISE:
             start_idx = 0
-            if self.consistent_sampling_params:
+            greedy = self.consistent_sampling_params and seqs[0].temperature == 0
+            if self.consistent_sampling_params and not greedy:
                 if seqs[0].top_k > 0:
-                    probs = self.sample_pipe(logits, temperature=seqs[0].temperature, top_k=seqs[0].top_k, top_p=seqs[0].top_p) 
+                    probs = self.sample_pipe(logits, temperature=seqs[0].temperature, top_k=seqs[0].top_k, top_p=seqs[0].top_p)
                 else:
                     probs = self.sample_pipe_topk0(logits, temperature=seqs[0].temperature, top_p=seqs[0].top_p)
             for seq in seqs:
@@ -136,15 +137,28 @@ class Scheduler:
                 if seq.status == SequenceStatus.DENOISING:
                     block_len = seq.block_length
                     if not self.consistent_sampling_params:
-                        if seq.top_k > 0:
-                            probs = self.sample_pipe(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_k=seq.top_k, top_p=seq.top_p) 
+                        if seq.temperature == 0:
+                            raw_probs = torch.softmax(logits[start_idx : start_idx + block_len], dim=-1)
+                            seq_x0 = logits[start_idx : start_idx + block_len].argmax(dim=-1)
+                            seq_x0_p = torch.gather(raw_probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)
+                        elif seq.top_k > 0:
+                            probs = self.sample_pipe(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_k=seq.top_k, top_p=seq.top_p)
+                            seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                            seq_x0_p = torch.gather(probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)
                         else:
                             probs = self.sample_pipe_topk0(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_p=seq.top_p)
-                        seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1) 
-                        seq_x0_p = torch.gather(probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
+                            seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                            seq_x0_p = torch.gather(probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)
                     else:
-                        seq_x0 = torch.multinomial(probs[start_idx : start_idx + block_len], num_samples=1).squeeze(-1) 
-                        seq_x0_p = torch.gather(probs[start_idx : start_idx + block_len], -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
+                        if seqs[0].temperature == 0:
+                            raw_probs = torch.softmax(logits, dim=-1)
+                            all_x0 = logits.argmax(dim=-1)
+                            all_x0_p = torch.gather(raw_probs, -1, all_x0.unsqueeze(-1)).squeeze(-1)
+                            seq_x0 = all_x0[start_idx : start_idx + block_len]
+                            seq_x0_p = all_x0_p[start_idx : start_idx + block_len]
+                        else:
+                            seq_x0 = torch.multinomial(probs[start_idx : start_idx + block_len], num_samples=1).squeeze(-1)
+                            seq_x0_p = torch.gather(probs[start_idx : start_idx + block_len], -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
                     
                     current_block_tensor = torch.tensor(seq.intermediate_block_tokens, device=logits.device)
                     # mask_index includes both mask tokens and randomly initialized positions
